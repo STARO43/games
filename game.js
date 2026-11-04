@@ -5143,25 +5143,31 @@ three/build/three.module.js:
 
 
 /* ==========================================================================
-   Москва-Сити: река, мосты, машины и хрущёвки
-   Дополнение к игре «Ворона над Москвой».
+   Москва-Сити: река, мосты, дороги, хрущёвки, парк — всё процедурное,
+   без внешних моделей. Дополнение к игре «Ворона над Москвой».
    Работает поверх window.__crowGame, который отдаёт основной script.js.
    ========================================================================== */
 (() => {
   "use strict";
 
-  const RIVER_INNER = 158;
-  const RIVER_OUTER = 182;
-  const RIVER_MID = (RIVER_INNER + RIVER_OUTER) / 2;
-  const RIVER_SEGMENTS = 180;
+  const WATER_Y = 0.05;
+  const BANK_Y = 0.13;
+  const BRIDGE_Y = 0.28;
+  const RIVER_BASE = 155;
+  const RIVER_W = 26;
   const ROAD_STEP = 60;
   const ROAD_HALF = 10.2;
-  const WATER_Y = 0.05;
-  const BRIDGE_Y = 0.28;
+  const CAR_COUNT = 18;
   const CAR_MIN_SPEED = 4.4;
   const CAR_MAX_SPEED = 7.2;
-  const CAR_COUNT = 20;
-  const MAX_HOUSES = 72;
+  const MAX_HOUSES = 96;
+
+  // Сектор парка на внешнем берегу (рад, atan2(z, x))
+  const PARK_A0 = 0.42;
+  const PARK_A1 = 1.78;
+  const PARK_PATH_OFF = 26; // дорожка от внешнего берега
+  const LAWN_IN = 8;
+  const LAWN_OUT = 50;
 
   const S = {
     started: false,
@@ -5169,72 +5175,197 @@ three/build/three.module.js:
     T: null,
     group: null,
     cars: [],
-    carTemplates: [],
     houses: [],
-    houseTemplates: [],
-    panelTemplate: null,
-    boxGeo: null,
-    cylGeo: null,
     prevVy: 0,
     prevSpeed: 0,
     pendingRoof: null,
     pendingCrash: null,
-    waterMat: null,
-    bridgeMat: null,
-    railMat: null,
+    boxGeo: null,
+    cylGeo: null,
   };
 
   const rand = (a, b) => a + Math.random() * (b - a);
-  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
   const mod = (n, m) => ((n % m) + m) % m;
 
-  /* ------------------------------------------------------------------ pack -- */
+  /* ---------------------------------------------------------------- river -- */
+  // Извилистое русло: радиус берега зависит от угла.
 
-  const PACK_URL = "models.pack";
-  const PACK_MAGIC = "CRWPACK1";
+  const rIn = (a) => RIVER_BASE + 7 * Math.sin(2 * a + 0.9) + 4 * Math.sin(3 * a + 4.2);
+  const rOut = (a) => rIn(a) + RIVER_W;
+  const inBand = (x, z) => {
+    const d = Math.hypot(x, z) - rIn(Math.atan2(z, x));
+    return d > -1.5 && d < RIVER_W + 1.5;
+  };
+  const inParkLawn = (x, z) => {
+    const a = Math.atan2(z, x);
+    if (a < PARK_A0 + 0.02 || a > PARK_A1 - 0.02) return false;
+    const d = Math.hypot(x, z) - rOut(a);
+    return d > LAWN_IN - 1 && d < LAWN_OUT + 1;
+  };
+  const distRoad = (x, z) => {
+    const dx = Math.abs(mod(x + ROAD_STEP / 2, ROAD_STEP) - ROAD_STEP / 2);
+    const dz = Math.abs(mod(z + ROAD_STEP / 2, ROAD_STEP) - ROAD_STEP / 2);
+    return Math.min(dx, dz);
+  };
+  const isRoad = (x, z) => distRoad(x, z) <= ROAD_HALF;
 
-  /* Все .glb лежат в одном контейнере: 8 байт сигнатуры, 4 байта длины
-     JSON-заголовка, сам заголовок и следом — содержимое файлов. Так проект
-     остаётся компактным, а модели грузятся одним запросом. */
-  function loadPack() {
-    return fetch(PACK_URL).then(async (res) => {
-      if (!res.ok) throw new Error(`models.pack: HTTP ${res.status}`);
-      const buffer = await res.arrayBuffer();
-      const bytes = new Uint8Array(buffer);
-      const magic = new TextDecoder().decode(bytes.subarray(0, 8));
-      if (magic !== PACK_MAGIC) {
-        throw new Error("models.pack: неверная сигнатура");
-      }
-
-      const headerLen = new DataView(buffer).getUint32(8, true);
-      const headerText = new TextDecoder().decode(
-        bytes.subarray(12, 12 + headerLen),
-      );
-      const header = JSON.parse(headerText);
-      const files = header.files || {};
-      const base = 12 + headerLen;
-
-      return {
-        names: Object.keys(files),
-        read(name) {
-          const entry = files[name];
-          if (!entry) {
-            return Promise.reject(
-              new Error(`models.pack: нет файла ${name}`),
-            );
-          }
-          return Promise.resolve(
-            buffer.slice(
-              base + entry.offset,
-              base + entry.offset + entry.size,
-            ),
-          );
-        },
-      };
-    });
+  function surfaceY(x, z) {
+    if (inBand(x, z)) return BRIDGE_Y;
+    return 0.04;
   }
 
-  /* ------------------------------------------------------------------ boot -- */
+  /* ------------------------------------------------------------- geometry -- */
+
+  let BG = null; // BufferGeometry
+  let BA = null; // BufferAttribute
+
+  function setupGeo(T) {
+    BG = Object.getPrototypeOf(T.PlaneGeometry.prototype).constructor;
+    const ground = S.game.city.ground;
+    const attr = ground.geometry.getAttribute("position");
+    BA = Object.getPrototypeOf(attr.constructor.prototype).constructor;
+    if (!BA || BA === Object) BA = attr.constructor;
+  }
+
+  // Лента между двумя радиус-функциями (вода, берега, газоны, дорожки).
+  function bandGeo(r0fn, r1fn, a0, a1, steps, y) {
+    const pos = [];
+    const nor = [];
+    const idx = [];
+    for (let i = 0; i <= steps; i++) {
+      const a = a0 + ((a1 - a0) * i) / steps;
+      const c = Math.cos(a);
+      const s = Math.sin(a);
+      const r0 = r0fn(a);
+      const r1 = r1fn(a);
+      pos.push(c * r0, y, s * r0, c * r1, y, s * r1);
+      nor.push(0, 1, 0, 0, 1, 0);
+    }
+    for (let i = 0; i < steps; i++) {
+      const a = i * 2;
+      idx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2);
+    }
+    const g = new BG();
+    g.setAttribute("position", new BA(new Float32Array(pos), 3));
+    g.setAttribute("normal", new BA(new Float32Array(nor), 3));
+    g.setIndex(new BA(new Uint32Array(idx), 1));
+    return g;
+  }
+
+  /* Батчер статичной геометрии: копит коробки/цилиндры/конусы в группы
+     с вершинными цветами, на выходе — по одному мешу на группу. */
+  function makeBatch() {
+    const groups = new Map();
+    const get = (name) => {
+      let g = groups.get(name);
+      if (!g) {
+        g = { pos: [], nor: [], col: [], idx: [], vi: 0 };
+        groups.set(name, g);
+      }
+      return g;
+    };
+
+    function pushBox(g, m, sx, sy, sz, c, rotY) {
+      const hx = sx / 2;
+      const hy = sy / 2;
+      const hz = sz / 2;
+      const cs = Math.cos(rotY || 0);
+      const sn = Math.sin(rotY || 0);
+      const faces = [
+        [1, 0, 0, [hx, -hy, -hz, hx, -hy, hz, hx, hy, hz, hx, hy, -hz]],
+        [-1, 0, 0, [-hx, -hy, hz, -hx, -hy, -hz, -hx, hy, -hz, -hx, hy, hz]],
+        [0, 1, 0, [-hx, hy, -hz, hx, hy, -hz, hx, hy, hz, -hx, hy, hz]],
+        [0, -1, 0, [-hx, -hy, hz, hx, -hy, hz, hx, -hy, -hz, -hx, -hy, -hz]],
+        [0, 0, 1, [hx, -hy, hz, -hx, -hy, hz, -hx, hy, hz, hx, hy, hz]],
+        [0, 0, -1, [hx, hy, -hz, -hx, hy, -hz, -hx, -hy, -hz, hx, -hy, -hz]],
+      ];
+      for (const f of faces) {
+        const base = g.vi;
+        const nx = f[0] * cs + f[2] * sn;
+        const nz = -f[0] * sn + f[2] * cs;
+        for (let i = 0; i < 4; i++) {
+          const px = f[3][i * 3];
+          const py = f[3][i * 3 + 1];
+          const pz = f[3][i * 3 + 2];
+          g.pos.push(m[0] + px * cs + pz * sn, m[1] + py, m[2] - px * sn + pz * cs);
+          g.nor.push(nx, f[1], nz);
+          g.col.push(c[0], c[1], c[2]);
+        }
+        g.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+        g.vi += 4;
+      }
+    }
+
+    function pushCyl(g, m, r, h, c, seg) {
+      const n = seg || 8;
+      for (let i = 0; i < n; i++) {
+        const a0 = (i / n) * Math.PI * 2;
+        const a1 = ((i + 1) / n) * Math.PI * 2;
+        const base = g.vi;
+        const am = (a0 + a1) / 2;
+        const pts = [
+          [Math.cos(a0) * r, -h / 2, Math.sin(a0) * r],
+          [Math.cos(a1) * r, -h / 2, Math.sin(a1) * r],
+          [Math.cos(a1) * r, h / 2, Math.sin(a1) * r],
+          [Math.cos(a0) * r, h / 2, Math.sin(a0) * r],
+        ];
+        for (const q of pts) {
+          g.pos.push(m[0] + q[0], m[1] + q[1], m[2] + q[2]);
+          g.nor.push(Math.cos(am), 0, Math.sin(am));
+          g.col.push(c[0], c[1], c[2]);
+        }
+        g.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+        g.vi += 4;
+      }
+    }
+
+    function pushCone(g, m, r, h, c, seg) {
+      const n = seg || 7;
+      for (let i = 0; i < n; i++) {
+        const a0 = (i / n) * Math.PI * 2;
+        const a1 = ((i + 1) / n) * Math.PI * 2;
+        const base = g.vi;
+        const am = (a0 + a1) / 2;
+        const sl = Math.hypot(r, h);
+        const nx = Math.cos(am) * (h / sl);
+        const nz = Math.sin(am) * (h / sl);
+        const ny = r / sl;
+        const pts = [
+          [Math.cos(a0) * r, -h / 2, Math.sin(a0) * r],
+          [Math.cos(a1) * r, -h / 2, Math.sin(a1) * r],
+          [0, h / 2, 0],
+        ];
+        for (const q of pts) {
+          g.pos.push(m[0] + q[0], m[1] + q[1], m[2] + q[2]);
+          g.nor.push(nx, ny, nz);
+          g.col.push(c[0], c[1], c[2]);
+        }
+        g.idx.push(base, base + 1, base + 2);
+        g.vi += 3;
+      }
+    }
+
+    function flush(T, spec) {
+      const out = [];
+      for (const [name, g] of groups) {
+        if (!g.vi) continue;
+        const mat = spec[name];
+        if (!mat) continue;
+        const geo = new BG();
+        geo.setAttribute("position", new BA(new Float32Array(g.pos), 3));
+        geo.setAttribute("normal", new BA(new Float32Array(g.nor), 3));
+        geo.setAttribute("color", new BA(new Float32Array(g.col), 3));
+        const IA = g.vi > 65535 ? Uint32Array : Uint16Array;
+        geo.setIndex(new BA(new IA(g.idx), 1));
+        out.push(new T.Mesh(geo, mat));
+      }
+      return out;
+    }
+
+    return { get, pushBox, pushCyl, pushCone, flush };
+  }
+
+  /* ----------------------------------------------------------------- boot -- */
 
   function boot() {
     if (S.started) return;
@@ -5257,75 +5388,20 @@ three/build/three.module.js:
     S.group = new T.Group();
     S.group.name = "moscow-city-addon";
     game.scene.add(S.group);
-
     S.boxGeo = new T.BoxGeometry(1, 1, 1);
     S.cylGeo = new T.CylinderGeometry(1, 1, 1, 10);
-
-    const groundGeom = game.city.ground.geometry;
-    const positionAttr = groundGeom.getAttribute("position");
-    S.BufferGeometry = Object.getPrototypeOf(T.PlaneGeometry.prototype)
-      .constructor;
-    // Именно базовый BufferAttribute: Float32BufferAttribute превратил бы
-    // индексы в Float32Array, а glDrawElements такое не принимает.
-    S.BufferAttribute = Object.getPrototypeOf(
-      positionAttr.constructor.prototype,
-    ).constructor;
-    if (!S.BufferAttribute || S.BufferAttribute === Object) {
-      S.BufferAttribute = positionAttr.constructor;
-    }
+    setupGeo(T);
 
     buildRiver();
-    buildBridges();
+    buildCityGeometry();
     spawnCars();
     patchGame();
     ensureFlightHint();
-    S.packPromise = loadPack();
-    loadAssets();
 
-    // Небольшая отладочная точка опоры для тестов в консоли.
     game.__cityAddon = S;
   }
 
-  /* --------------------------------------------------------------- geometry -- */
-
-  function ringGeometry(r0, r1, segments) {
-    const T = S.T;
-    const ground = S.game.city.ground;
-    const BufferGeometry = Object.getPrototypeOf(
-      T.PlaneGeometry.prototype,
-    ).constructor;
-    const BufferAttribute = ground.geometry.getAttribute("position")
-      .constructor;
-
-    const positions = new Float32Array((segments + 1) * 6);
-    const indices = [];
-    for (let i = 0; i <= segments; i++) {
-      const a = (i / segments) * Math.PI * 2;
-      const c = Math.cos(a);
-      const s = Math.sin(a);
-      positions[i * 6 + 0] = c * r0;
-      positions[i * 6 + 1] = 0;
-      positions[i * 6 + 2] = s * r0;
-      positions[i * 6 + 3] = c * r1;
-      positions[i * 6 + 4] = 0;
-      positions[i * 6 + 5] = s * r1;
-    }
-    for (let i = 0; i < segments; i++) {
-      const a = i * 2;
-      const b = i * 2 + 1;
-      const c = i * 2 + 2;
-      const d = i * 2 + 3;
-      indices.push(a, b, c, b, d, c);
-    }
-
-    const geo = new BufferGeometry();
-    geo.setAttribute("position", new BufferAttribute(positions, 3));
-    geo.setIndex(indices);
-    geo.computeVertexNormals();
-    return geo;
-  }
-
-  /* ------------------------------------------------------------------ river -- */
+  /* ---------------------------------------------------------------- river -- */
 
   function buildRiver() {
     const T = S.T;
@@ -5339,29 +5415,25 @@ three/build/three.module.js:
       envMapIntensity: 1.7,
       side: 2,
     });
-
-    const waterGeo = ringGeometry(RIVER_INNER, RIVER_OUTER, RIVER_SEGMENTS);
-    const water = new T.Mesh(waterGeo, S.waterMat);
-    water.position.y = WATER_Y;
+    const water = new T.Mesh(bandGeo(rIn, rOut, 0, Math.PI * 2, 220, WATER_Y), S.waterMat);
     water.renderOrder = 1;
     S.group.add(water);
 
-    // Бетонные берега.
+    // Бетонные набережные.
     const bankMat = new T.MeshStandardMaterial({
       color: 0x151b24,
       roughness: 0.92,
       metalness: 0.05,
+      side: 2,
     });
     const innerBank = new T.Mesh(
-      ringGeometry(RIVER_INNER - 3.2, RIVER_INNER, RIVER_SEGMENTS),
+      bandGeo((a) => rIn(a) - 3.2, rIn, 0, Math.PI * 2, 220, BANK_Y),
       bankMat,
     );
     const outerBank = new T.Mesh(
-      ringGeometry(RIVER_OUTER, RIVER_OUTER + 3.2, RIVER_SEGMENTS),
+      bandGeo(rOut, (a) => rOut(a) + 3.2, 0, Math.PI * 2, 220, BANK_Y),
       bankMat,
     );
-    innerBank.position.y = 0.14;
-    outerBank.position.y = 0.14;
     S.group.add(innerBank, outerBank);
 
     // Светящаяся кромка воды.
@@ -5374,180 +5446,528 @@ three/build/three.module.js:
       side: 2,
     });
     const rimIn = new T.Mesh(
-      ringGeometry(RIVER_INNER - 0.55, RIVER_INNER + 0.15, RIVER_SEGMENTS),
+      bandGeo((a) => rIn(a) - 0.55, (a) => rIn(a) + 0.15, 0, Math.PI * 2, 220, 0.11),
       rimMat,
     );
     const rimOut = new T.Mesh(
-      ringGeometry(RIVER_OUTER - 0.15, RIVER_OUTER + 0.55, RIVER_SEGMENTS),
+      bandGeo((a) => rOut(a) - 0.15, (a) => rOut(a) + 0.55, 0, Math.PI * 2, 220, 0.11),
       rimMat,
     );
-    rimIn.position.y = 0.12;
-    rimOut.position.y = 0.12;
     S.group.add(rimIn, rimOut);
   }
 
-  function buildBridges() {
+  /* --------------------------------------------------------- city batch -- */
+
+  function buildCityGeometry() {
     const T = S.T;
-    S.bridgeMat = new T.MeshStandardMaterial({
-      color: 0x202a36,
-      emissive: 0x071522,
-      emissiveIntensity: 0.9,
-      roughness: 0.55,
-      metalness: 0.42,
+    const vcStd = new T.MeshStandardMaterial({
+      vertexColors: true,
+      roughness: 0.88,
+      metalness: 0.05,
     });
-    S.railMat = new T.MeshStandardMaterial({
-      color: 0x38516a,
-      emissive: 0x2a9ec9,
-      emissiveIntensity: 2.1,
+    const matWinLit = new T.MeshStandardMaterial({
+      color: 0x000000,
+      emissive: 0xffbe66,
+      emissiveIntensity: 1.15,
+      roughness: 0.4,
+    });
+    const matWinDark = new T.MeshStandardMaterial({
+      color: 0x0a0e13,
       roughness: 0.35,
-      metalness: 0.25,
+      metalness: 0.3,
     });
+    const matGlow = new T.MeshStandardMaterial({
+      color: 0x111111,
+      emissive: 0x2a9ec9,
+      emissiveIntensity: 2.2,
+    });
+    const matDash = new T.MeshStandardMaterial({
+      color: 0x000000,
+      emissive: 0xbfd7ef,
+      emissiveIntensity: 0.55,
+    });
+    const matBulb = new T.MeshStandardMaterial({
+      color: 0x000000,
+      emissive: 0xffd9a0,
+      emissiveIntensity: 2.2,
+    });
+    const spec = {
+      wall: vcStd,
+      winLit: matWinLit,
+      winDark: matWinDark,
+      deck: vcStd,
+      glow: matGlow,
+      dash: matDash,
+      trunk: vcStd,
+      crown: vcStd,
+      bench: vcStd,
+      post: vcStd,
+      bulb: matBulb,
+    };
 
-    // Мосты в местах, где сетка дорог пересекает кольцо реки.
-    for (let c = -180; c <= 180; c += ROAD_STEP) {
-      if (Math.abs(c) >= RIVER_OUTER - 1) continue;
-      const outer = Math.sqrt(RIVER_OUTER * RIVER_OUTER - c * c);
-      const inner =
-        Math.abs(c) < RIVER_INNER
-          ? Math.sqrt(RIVER_INNER * RIVER_INNER - c * c)
-          : 0;
+    const batch = makeBatch();
+    buildBridges(batch);
+    buildRoadDashes(batch);
+    buildPark(batch);
+    buildHousesAndGroves(batch);
+    buildEmbankment(batch);
 
-      if (inner > 0) {
-        addBridge(c, -((inner + outer) / 2), outer - inner, true);
-        addBridge(c, (inner + outer) / 2, outer - inner, true);
-        addBridge(-((inner + outer) / 2), c, outer - inner, false);
-        addBridge((inner + outer) / 2, c, outer - inner, false);
-      } else {
-        addBridge(c, 0, outer, true);
-        addBridge(0, c, outer, false);
+    for (const mesh of batch.flush(T, spec)) {
+      mesh.frustumCulled = false; // один общий батч — просто отключаем отсечение
+      S.group.add(mesh);
+    }
+  }
+
+  // Свободен ли сегмент парка (не пересекает дорогу/мост).
+  function parkAllowed(a) {
+    for (const off of [LAWN_IN + 1, PARK_PATH_OFF, LAWN_OUT - 1]) {
+      const r = rOut(a) + off;
+      if (distRoad(Math.cos(a) * r, Math.sin(a) * r) < 15) return false;
+    }
+    return true;
+  }
+
+  /* -------------------------------------------------------------- bridges -- */
+
+  function buildBridges(batch) {
+    // Мосты там, где сетка дорог пересекает русло: ищем непрерывные
+    // отрезки воды вдоль каждой линии сетки.
+    for (const axis of ["z", "x"]) {
+      for (let k = -5; k <= 5; k++) {
+        const line = k * ROAD_STEP;
+        let s0 = null;
+        for (let t = -210; t <= 210; t += 1.25) {
+          const x = axis === "z" ? line : t;
+          const z = axis === "z" ? t : line;
+          const b = inBand(x, z);
+          if (b && s0 === null) s0 = t;
+          if (!b && s0 !== null) {
+            addBridge(batch, axis, line, s0, t);
+            s0 = null;
+          }
+        }
+        if (s0 !== null) addBridge(batch, axis, line, s0, 210);
       }
     }
   }
 
-  function addBridge(x, z, halfLen, alongZ) {
-    const T = S.T;
-    const deckLen = halfLen * 2 + 7;
-    const deck = new T.Mesh(S.boxGeo, S.bridgeMat);
-    if (alongZ) {
-      deck.scale.set(23, 0.32, deckLen);
-    } else {
-      deck.scale.set(deckLen, 0.32, 23);
+  function addBridge(batch, axis, line, a0, a1) {
+    const len = a1 - a0;
+    if (len < 8) return;
+    const mid = (a0 + a1) / 2;
+    const deckLen = len + 16;
+    const x = axis === "z" ? line : mid;
+    const z = axis === "z" ? mid : line;
+    const rotY = axis === "z" ? 0 : Math.PI / 2;
+    const deck = batch.get("deck");
+    batch.pushBox(deck, [x, BRIDGE_Y - 0.16, z], 23, 0.32, deckLen, [0.125, 0.16, 0.2], rotY);
+    // Опоры в воде.
+    for (const s of [-0.24, 0.24]) {
+      const px = axis === "z" ? x : x + s * deckLen;
+      const pz = axis === "z" ? z + s * deckLen : z;
+      batch.pushCyl(deck, [px, -0.5, pz], 1.5, 1.7, [0.1, 0.12, 0.14], 8);
     }
-    deck.position.set(x, BRIDGE_Y - 0.16, z);
-    S.group.add(deck);
-
     // Светящиеся перила.
+    const glow = batch.get("glow");
     for (const side of [-1, 1]) {
-      const rail = new T.Mesh(S.boxGeo, S.railMat);
-      if (alongZ) {
-        rail.scale.set(0.22, 0.22, deckLen);
-        rail.position.set(x + side * 11.4, BRIDGE_Y + 0.55, z);
-      } else {
-        rail.scale.set(deckLen, 0.22, 0.22);
-        rail.position.set(x, BRIDGE_Y + 0.55, z + side * 11.4);
-      }
-      S.group.add(rail);
+      const rx = axis === "z" ? x + side * 11.4 : x;
+      const rz = axis === "z" ? z : z + side * 11.4;
+      batch.pushBox(glow, [rx, BRIDGE_Y + 0.55, rz],
+        axis === "z" ? 0.22 : deckLen, 0.22, axis === "z" ? deckLen : 0.22,
+        [1, 1, 1], rotY);
     }
   }
 
-  /* ------------------------------------------------------------- road logic -- */
+  /* ---------------------------------------------------------- road marks -- */
 
-  function isRoad(x, z) {
-    const dx = Math.abs(mod(x + ROAD_STEP / 2, ROAD_STEP) - ROAD_STEP / 2);
-    const dz = Math.abs(mod(z + ROAD_STEP / 2, ROAD_STEP) - ROAD_STEP / 2);
-    return Math.min(dx, dz) <= ROAD_HALF;
+  function buildRoadDashes(batch) {
+    const g = batch.get("dash");
+    for (const axis of ["z", "x"]) {
+      for (let k = -5; k <= 5; k++) {
+        const line = k * ROAD_STEP;
+        for (let t = -344; t <= 344; t += 9) {
+          const x = axis === "z" ? line : t;
+          const z = axis === "z" ? t : line;
+          if (inBand(x, z)) continue; // над водой — мост, разметка на нём есть
+          if (Math.hypot(x, z) > 344) continue;
+          batch.pushBox(g, [x, surfaceY(x, z) + 0.035, z],
+            axis === "z" ? 0.32 : 3.4, 0.025, axis === "z" ? 3.4 : 0.32,
+            [1, 1, 1], 0);
+        }
+      }
+    }
   }
 
-  function surfaceY(x, z) {
-    const r = Math.hypot(x, z);
-    if (r > RIVER_INNER - 2.5 && r < RIVER_OUTER + 2.5) return BRIDGE_Y;
-    return 0.04;
+  /* ----------------------------------------------------------------- park -- */
+
+  function buildPark(batch) {
+    const T = S.T;
+    // Газон и дорожка — ленты вдоль реки с разрывами на дорогах.
+    const runs = [];
+    let run0 = null;
+    for (let a = PARK_A0; a <= PARK_A1 + 1e-6; a += 0.02) {
+      const ok = a <= PARK_A1 && parkAllowed(a);
+      if (ok && run0 === null) run0 = a;
+      if (!ok && run0 !== null) {
+        runs.push([run0, a]);
+        run0 = null;
+      }
+    }
+    if (run0 !== null) runs.push([run0, PARK_A1]);
+
+    const lawnMat = new T.MeshStandardMaterial({ color: 0x12331c, roughness: 1 });
+    const pathMat = new T.MeshStandardMaterial({ color: 0x35383e, roughness: 0.95 });
+    for (const [a0, a1] of runs) {
+      const steps = Math.max(2, Math.round((a1 - a0) / 0.02));
+      S.group.add(new T.Mesh(bandGeo(
+        (a) => rOut(a) + LAWN_IN, (a) => rOut(a) + LAWN_OUT,
+        a0 - 0.012, a1 + 0.012, steps, 0.07,
+      ), lawnMat));
+      S.group.add(new T.Mesh(bandGeo(
+        (a) => rOut(a) + PARK_PATH_OFF - 2.6, (a) => rOut(a) + PARK_PATH_OFF + 2.6,
+        a0 - 0.012, a1 + 0.012, steps, 0.055,
+      ), pathMat));
+    }
+
+    const crownCols = [
+      [0.09, 0.2, 0.11],
+      [0.12, 0.23, 0.12],
+      [0.16, 0.2, 0.07],
+    ];
+
+    function addTree(x, z) {
+      const s = rand(0.85, 1.3);
+      batch.pushCyl(batch.get("trunk"), [x, 1.2 * s, z], 0.2 * s, 2.4 * s, [0.22, 0.15, 0.1], 6);
+      const c = crownCols[Math.floor(Math.random() * crownCols.length)];
+      if (Math.random() < 0.4) {
+        batch.pushCone(batch.get("crown"), [x, 2.2 * s + 4 * s, z], 2.1 * s, 8 * s, c, 7);
+      } else {
+        batch.pushCone(batch.get("crown"), [x, 2.2 * s + 2.2 * s, z], 2.7 * s, 4.6 * s, c, 7);
+        batch.pushCone(batch.get("crown"), [x, 2.2 * s + 5.2 * s, z], 1.9 * s, 3.4 * s, c, 7);
+      }
+    }
+
+    function addBench(x, z, yaw) {
+      const b = batch.get("bench");
+      const wood = [0.35, 0.24, 0.15];
+      const dark = [0.1, 0.11, 0.12];
+      batch.pushBox(b, [x, 0.46, z], 1.9, 0.09, 0.42, wood, yaw);
+      const cs = Math.cos(yaw);
+      const sn = Math.sin(yaw);
+      batch.pushBox(b, [x - sn * 0.2, 0.78, z - cs * 0.2], 1.9, 0.42, 0.07, wood, yaw);
+      for (const s of [-0.8, 0.8]) {
+        batch.pushBox(b, [x + s * cs, 0.22, z - s * sn], 0.09, 0.45, 0.4, dark, yaw);
+      }
+    }
+
+    function addLantern(x, z) {
+      batch.pushCyl(batch.get("post"), [x, 1.65, z], 0.07, 3.3, [0.13, 0.14, 0.16], 6);
+      batch.pushBox(batch.get("bulb"), [x, 3.4, z], 0.22, 0.16, 0.22, [1, 1, 1], 0);
+    }
+
+    const parkTrees = [];
+    let tries = 0;
+    let placed = 0;
+    while (placed < 64 && tries < 400) {
+      tries++;
+      const a = rand(PARK_A0 + 0.03, PARK_A1 - 0.03);
+      const r = rOut(a) + rand(LAWN_IN + 3, LAWN_OUT - 3);
+      const x = Math.cos(a) * r;
+      const z = Math.sin(a) * r;
+      if (distRoad(x, z) < 15.5) continue;
+      if (Math.abs(r - (rOut(a) + PARK_PATH_OFF)) < 4.5) continue;
+      let bad = false;
+      for (const t of parkTrees) {
+        if (Math.hypot(t[0] - x, t[1] - z) < 4.5) { bad = true; break; }
+      }
+      if (bad) continue;
+      parkTrees.push([x, z]);
+      addTree(x, z);
+      placed++;
+    }
+
+    // Скамейки вдоль дорожки и фонари.
+    let side = 1;
+    for (let a = PARK_A0 + 0.07; a < PARK_A1 - 0.05; a += 0.075) {
+      if (!parkAllowed(a)) continue;
+      const rp = rOut(a) + PARK_PATH_OFF + side * 5;
+      const x = Math.cos(a) * rp;
+      const z = Math.sin(a) * rp;
+      if (distRoad(x, z) < 15.5) { side = -side; continue; }
+      addBench(x, z, a + Math.PI / 2 + (side > 0 ? 0 : Math.PI));
+      side = -side;
+    }
+    let lside = 1;
+    for (let a = PARK_A0 + 0.05; a < PARK_A1 - 0.03; a += 0.055) {
+      if (!parkAllowed(a)) continue;
+      const rp = rOut(a) + PARK_PATH_OFF + lside * 4.2;
+      const x = Math.cos(a) * rp;
+      const z = Math.sin(a) * rp;
+      if (distRoad(x, z) < 15.5) { lside = -lside; continue; }
+      addLantern(x, z);
+      lside = -lside;
+    }
   }
 
-  /* ------------------------------------------------------------------- cars -- */
+  /* ------------------------------------------------------ houses & groves -- */
+
+  const WALL_COLS = [
+    [0.55, 0.5, 0.42],
+    [0.47, 0.51, 0.55],
+    [0.58, 0.47, 0.36],
+    [0.43, 0.48, 0.43],
+    [0.55, 0.48, 0.4],
+    [0.5, 0.44, 0.44],
+  ];
+
+  function buildHouse(batch, x, z, yaw, L, D, floors) {
+    const wall = batch.get("wall");
+    const c = WALL_COLS[Math.floor(Math.random() * WALL_COLS.length)]
+      .map((v) => v * rand(0.85, 1.1));
+    const H = floors * 2.7 + 0.6;
+
+    batch.pushBox(wall, [x, H / 2, z], L, H, D, c, yaw);
+
+    // Кровля с парапетом.
+    batch.pushBox(wall, [x, H + 0.25, z], L + 0.7, 0.5, D + 0.7,
+      [c[0] * 0.45, c[1] * 0.45, c[2] * 0.45], yaw);
+
+    // Козырьки подъездов.
+    const cs = Math.cos(yaw);
+    const sn = Math.sin(yaw);
+    for (const s of [-0.28, 0.28]) {
+      const lx = s * L;
+      const px = x + lx * cs;
+      const pz = z - lx * sn;
+      for (const face of [-1, 1]) {
+        const wx = px + (D / 2 + 0.9) * sn * face;
+        const wz = pz + (D / 2 + 0.9) * cs * face;
+        batch.pushBox(wall, [wx, 2.55, wz], 2.6, 0.25, 1.9,
+          [c[0] * 0.6, c[1] * 0.6, c[2] * 0.6], yaw);
+      }
+    }
+
+    // Окна на длинных фасадах.
+    const cols = Math.max(3, Math.floor((L - 3) / 2.7));
+    for (let f = 0; f < floors; f++) {
+      const y = 1.35 + f * 2.7;
+      for (let i = 0; i < cols; i++) {
+        const lx = (i - (cols - 1) / 2) * 2.7;
+        for (const face of [-1, 1]) {
+          const lit = Math.random() < (f === 0 ? 0.3 : 0.55);
+          const px = x + lx * cs + (D / 2 + 0.08) * sn * face;
+          const pz = z - lx * sn + (D / 2 + 0.08) * cs * face;
+          batch.pushBox(
+            batch.get(lit ? "winLit" : "winDark"),
+            [px, y, pz], 1.35, 1.65, 0.12, [1, 1, 1], yaw,
+          );
+        }
+      }
+    }
+
+    S.houses.push({
+      x, z, yaw,
+      cos: cs, sin: sn,
+      hx: L / 2 - 0.4,
+      hz: D / 2 - 0.4,
+      top: H + 0.55,
+      obj: null,
+    });
+  }
+
+  function buildHousesAndGroves(batch) {
+    const crownCols = [
+      [0.09, 0.2, 0.11],
+      [0.12, 0.23, 0.12],
+      [0.17, 0.21, 0.08],
+    ];
+    const groveTrees = [];
+
+    function addTree(x, z) {
+      const s = rand(0.8, 1.25);
+      batch.pushCyl(batch.get("trunk"), [x, 1.2 * s, z], 0.18 * s, 2.4 * s, [0.22, 0.15, 0.1], 6);
+      const c = crownCols[Math.floor(Math.random() * crownCols.length)];
+      batch.pushCone(batch.get("crown"), [x, 2.2 * s + 2.1 * s, z], 2.6 * s, 4.4 * s, c, 7);
+      if (Math.random() < 0.5) {
+        batch.pushCone(batch.get("crown"), [x, 2.2 * s + 5 * s, z], 1.8 * s, 3.2 * s, c, 7);
+      }
+      groveTrees.push([x, z]);
+    }
+
+    for (let k = -5; k <= 4; k++) {
+      for (let m = -5; m <= 4; m++) {
+        const bx = k * ROAD_STEP + 30;
+        const bz = m * ROAD_STEP + 30;
+        const a = Math.atan2(bz, bx);
+        const r = Math.hypot(bx, bz);
+        if (r > 345) continue;
+        const inParkSector = a > PARK_A0 - 0.06 && a < PARK_A1 + 0.06;
+        if (!inParkSector && r > rOut(a) + 26 && Math.random() > 0.08 &&
+          S.houses.length < MAX_HOUSES
+        ) {
+          // Дом лицом к ближайшей улице.
+          const vertical = Math.random() < 0.5;
+          const line = vertical
+            ? Math.round(bx / ROAD_STEP) * ROAD_STEP
+            : Math.round(bz / ROAD_STEP) * ROAD_STEP;
+          const sideSign = vertical ? (line < bx ? 1 : -1) : (line < bz ? 1 : -1);
+          const along = rand(-7, 7);
+          const off = 24;
+          const hx0 = vertical ? line + sideSign * off : bx + along;
+          const hz0 = vertical ? bz + along : line + sideSign * off;
+          const ha = Math.atan2(hz0, hx0);
+          const hr = Math.hypot(hx0, hz0);
+          const floors = Math.random() < 0.2 ? 9 : 5;
+          const L = floors === 9 ? rand(36, 46) : rand(27, 40);
+          const D = floors === 9 ? rand(12.5, 14) : rand(11, 13);
+          let ok = hr > rOut(ha) + 24 && hr < 342;
+          ok = ok && !inBand(hx0, hz0);
+          ok = ok && !(ha > PARK_A0 - 0.06 && ha < PARK_A1 + 0.06);
+          ok = ok && distRoad(hx0, hz0) > ROAD_HALF + 2.5;
+          if (ok) {
+            for (const h of S.houses) {
+              if (Math.hypot(h.x - hx0, h.z - hz0) < 25) { ok = false; break; }
+            }
+          }
+          if (ok) {
+            const yaw = (vertical ? Math.PI / 2 : 0) + rand(-0.07, 0.07);
+            buildHouse(batch, hx0, hz0, yaw, L, D, floors);
+          }
+        }
+
+        // Дворы: деревья (в парке гуще).
+        if (r > rOut(a) + 10 && r < 343) {
+          const n = inParkSector ? 3 : (Math.random() < 0.6 ? 2 : 1);
+          for (let i = 0; i < n && groveTrees.length < 210; i++) {
+            const spread = inParkSector ? 27 : 24;
+            const tx = bx + rand(-spread, spread);
+            const tz = bz + rand(-spread, spread);
+            const ta = Math.atan2(tz, tx);
+            const tr = Math.hypot(tx, tz);
+            if (tr < rOut(ta) + 10 || tr > 343) continue;
+            if (distRoad(tx, tz) < 15.5) continue;
+            let bad = false;
+            for (const h of S.houses) {
+              if (Math.hypot(h.x - tx, h.z - tz) < Math.max(h.hx, h.hz) + 6) { bad = true; break; }
+            }
+            if (!bad) {
+              for (const t of groveTrees) {
+                if (Math.hypot(t[0] - tx, t[1] - tz) < 4) { bad = true; break; }
+              }
+            }
+            if (!bad) addTree(tx, tz);
+          }
+        }
+      }
+    }
+  }
+
+  /* ---------------------------------------------------------- embankment -- */
+
+  function buildEmbankment(batch) {
+    // Столбики-светильники вдоль обоих берегов (кроме подъездов к мостам).
+    const N = 150;
+    for (let i = 0; i < N; i++) {
+      const a = (i / N) * Math.PI * 2;
+      for (const side of [-1, 1]) {
+        const r = side < 0 ? rIn(a) - 2.8 : rOut(a) + 2.8;
+        const x = Math.cos(a) * r;
+        const z = Math.sin(a) * r;
+        if (distRoad(x, z) < 14) continue;
+        batch.pushCyl(batch.get("post"), [x, 0.48, z], 0.1, 0.95, [0.13, 0.14, 0.16], 6);
+        batch.pushBox(batch.get("bulb"), [x, 1.02, z], 0.16, 0.12, 0.16, [1, 1, 1], 0);
+      }
+    }
+  }
+
+  /* ----------------------------------------------------------------- cars -- */
 
   function spawnCars() {
     for (let i = 0; i < CAR_COUNT; i++) {
       const root = new S.T.Group();
-      const visual = makeFallbackCar();
+      const kind = i % 6 === 4 ? "bus" : i % 6 === 2 ? "truck" : "sedan";
+      const visual = makeCar(kind);
       root.add(visual);
       S.group.add(root);
+      const dims = kind === "bus"
+        ? { height: 3.1, length: 9.2, radius: 5.0 }
+        : kind === "truck"
+          ? { height: 2.9, length: 8.4, radius: 4.6 }
+          : { height: 1.85, length: 4.5, radius: 2.45 };
       const car = {
         root,
         visual,
         axis: Math.random() < 0.5 ? "z" : "x",
         dir: Math.random() < 0.5 ? 1 : -1,
         speed: rand(CAR_MIN_SPEED, CAR_MAX_SPEED),
-        height: 1.85,
-        length: 4.5,
-        radius: 2.45,
         x: 0,
         z: 0,
+        ...dims,
       };
       respawnCar(car, { x: 0, z: 0 });
       S.cars.push(car);
     }
   }
 
-  function makeFallbackCar() {
+  function makeCar(kind) {
     const T = S.T;
     const g = new T.Group();
+    const palette = [0xc8ccd2, 0x7d94b8, 0x6e8f70, 0xb8a98c, 0xa8524a, 0x3c4654];
     const bodyMat = new T.MeshStandardMaterial({
-      color: 0x263243,
-      roughness: 0.52,
-      metalness: 0.38,
+      color: palette[Math.floor(Math.random() * palette.length)],
+      roughness: 0.5,
+      metalness: 0.4,
     });
-    const glassMat = new T.MeshStandardMaterial({
-      color: 0x101821,
-      roughness: 0.18,
-      metalness: 0.5,
-    });
-    const tireMat = new T.MeshStandardMaterial({
-      color: 0x06080b,
-      roughness: 0.95,
-    });
-
-    const body = new T.Mesh(S.boxGeo, bodyMat);
-    body.scale.set(1.9, 0.72, 4.5);
-    body.position.y = 0.76;
-    g.add(body);
-
-    const cabin = new T.Mesh(S.boxGeo, glassMat);
-    cabin.scale.set(1.58, 0.58, 1.85);
-    cabin.position.set(0, 1.4, -0.15);
-    g.add(cabin);
-
-    for (const x of [-0.95, 0.95]) {
-      for (const z of [-1.45, 1.45]) {
-        const wheel = new T.Mesh(S.cylGeo, tireMat);
-        wheel.scale.set(0.34, 0.28, 0.34);
-        wheel.rotation.z = Math.PI / 2;
-        wheel.position.set(x, 0.35, z);
-        g.add(wheel);
-      }
-    }
-
+    const darkMat = new T.MeshStandardMaterial({ color: 0x11161d, roughness: 0.6, metalness: 0.3 });
+    const glassMat = new T.MeshStandardMaterial({ color: 0x101821, roughness: 0.18, metalness: 0.5 });
+    const tireMat = new T.MeshStandardMaterial({ color: 0x06080b, roughness: 0.95 });
     const headMat = new T.MeshStandardMaterial({
-      color: 0xfff2c8,
-      emissive: 0xffd275,
-      emissiveIntensity: 2.4,
-      roughness: 0.3,
+      color: 0xfff2c8, emissive: 0xffd275, emissiveIntensity: 2.4, roughness: 0.3,
     });
     const tailMat = new T.MeshStandardMaterial({
-      color: 0x5d0b0b,
-      emissive: 0xff2020,
-      emissiveIntensity: 1.8,
-      roughness: 0.4,
+      color: 0x5d0b0b, emissive: 0xff2020, emissiveIntensity: 1.8, roughness: 0.4,
     });
-    for (const x of [-0.64, 0.64]) {
-      const hl = new T.Mesh(S.boxGeo, headMat);
-      hl.scale.set(0.28, 0.16, 0.08);
-      hl.position.set(x, 0.83, 2.28);
-      g.add(hl);
-      const tl = new T.Mesh(S.boxGeo, tailMat);
-      tl.scale.set(0.25, 0.14, 0.06);
-      tl.position.set(x, 0.83, -2.29);
-      g.add(tl);
+
+    const add = (mat, sx, sy, sz, x, y, z) => {
+      const m = new T.Mesh(S.boxGeo, mat);
+      m.scale.set(sx, sy, sz);
+      m.position.set(x, y, z);
+      g.add(m);
+      return m;
+    };
+    const wheel = (x, z) => {
+      const w = new T.Mesh(S.cylGeo, tireMat);
+      w.scale.set(0.34, 0.28, 0.34);
+      w.rotation.z = Math.PI / 2;
+      w.position.set(x, 0.35, z);
+      g.add(w);
+    };
+
+    if (kind === "sedan") {
+      add(bodyMat, 1.9, 0.72, 4.5, 0, 0.76, 0);
+      add(glassMat, 1.58, 0.58, 1.85, 0, 1.4, -0.15);
+      for (const x of [-0.95, 0.95]) for (const z of [-1.45, 1.45]) wheel(x, z);
+      for (const x of [-0.64, 0.64]) {
+        add(headMat, 0.28, 0.16, 0.08, x, 0.83, 2.28);
+        add(tailMat, 0.25, 0.14, 0.06, x, 0.83, -2.29);
+      }
+    } else if (kind === "truck") {
+      add(bodyMat, 2.3, 1.1, 2.6, 0, 1.15, 2.9);
+      add(glassMat, 2.1, 0.6, 0.7, 0, 1.95, 3.4);
+      add(darkMat, 2.35, 2.0, 5.2, 0, 1.6, -1.2);
+      for (const x of [-1.05, 1.05]) for (const z of [-3.0, -0.6, 2.4]) wheel(x, z);
+      for (const x of [-0.8, 0.8]) {
+        add(headMat, 0.3, 0.16, 0.08, x, 0.9, 4.22);
+        add(tailMat, 0.26, 0.14, 0.06, x, 0.9, -3.82);
+      }
+    } else {
+      add(bodyMat, 2.4, 2.3, 9.0, 0, 1.55, 0);
+      add(glassMat, 2.2, 0.7, 8.2, 0, 2.15, 0);
+      for (const x of [-1.1, 1.1]) for (const z of [-3.2, -0.2, 3.2]) wheel(x, z);
+      for (const x of [-0.85, 0.85]) {
+        add(headMat, 0.3, 0.16, 0.08, x, 0.95, 4.55);
+        add(tailMat, 0.26, 0.14, 0.06, x, 0.95, -4.55);
+      }
     }
     return g;
   }
@@ -5559,13 +5979,11 @@ three/build/three.module.js:
 
     const lane = car.dir > 0 ? 3.2 : -3.2;
     if (car.axis === "z") {
-      const line = Math.round((around.x + rand(-260, 260)) / ROAD_STEP) *
-        ROAD_STEP;
+      const line = Math.round((around.x + rand(-260, 260)) / ROAD_STEP) * ROAD_STEP;
       car.x = line + lane;
       car.z = around.z + rand(-300, 300);
     } else {
-      const line = Math.round((around.z + rand(-260, 260)) / ROAD_STEP) *
-        ROAD_STEP;
+      const line = Math.round((around.z + rand(-260, 260)) / ROAD_STEP) * ROAD_STEP;
       car.z = line + lane;
       car.x = around.x + rand(-300, 300);
     }
@@ -5573,8 +5991,7 @@ three/build/three.module.js:
   }
 
   function updateCarTransform(car) {
-    const y = surfaceY(car.x, car.z);
-    car.root.position.set(car.x, y, car.z);
+    car.root.position.set(car.x, surfaceY(car.x, car.z), car.z);
     if (car.axis === "z") {
       car.root.rotation.y = car.dir > 0 ? 0 : Math.PI;
     } else {
@@ -5596,7 +6013,6 @@ three/build/three.module.js:
         if (car.x > 380) car.x -= 760;
         else if (car.x < -380) car.x += 760;
       }
-
       if (Math.hypot(car.x - p.x, car.z - p.z) > 460) {
         respawnCar(car, p);
         continue;
@@ -5621,7 +6037,7 @@ three/build/three.module.js:
     }
   }
 
-  /* --------------------------------------------------------------- buildings -- */
+  /* ------------------------------------------------------------ gameplay -- */
 
   function patchGame() {
     const game = S.game;
@@ -5671,11 +6087,11 @@ three/build/three.module.js:
       if (why === "fall" && game.phase === "flying") {
         const b = game.body;
         const p = b.position;
-        if (
-          isRoad(p.x, p.z) &&
+        const softGround =
+          (isRoad(p.x, p.z) || inParkLawn(p.x, p.z)) &&
           S.prevVy > -8.6 &&
-          Math.hypot(b.velocity.x, b.velocity.z) < 17
-        ) {
+          Math.hypot(b.velocity.x, b.velocity.z) < 17;
+        if (softGround) {
           game.startLanding({
             x: p.x,
             y: surfaceY(p.x, p.z),
@@ -5721,12 +6137,7 @@ three/build/three.module.js:
       const normalY = Math.abs(contact.ni ? contact.ni.y : 0);
       const isBigRoof = he.y > 2 && he.x * he.z > 25;
 
-      if (
-        normalY > 0.62 &&
-        impact < 7 &&
-        S.prevVy > -8.6 &&
-        isBigRoof
-      ) {
+      if (normalY > 0.62 && impact < 7 && S.prevVy > -8.6 && isBigRoof) {
         S.pendingRoof = {
           x: other.position.x,
           y: other.position.y + he.y,
@@ -5752,7 +6163,7 @@ three/build/three.module.js:
     const game = S.game;
     const p = game.body.position;
 
-    // Сначала крыши: и процедурные дома, и загруженные модели.
+    // Сначала крыши процедурных домов и базовых зданий.
     if (S.prevVy > -8.6 && speed < 19) {
       for (const chunk of game.city.chunks.values()) {
         for (const r of chunk.bodies) {
@@ -5764,13 +6175,7 @@ three/build/three.module.js:
             Math.abs(p.x - r.x) < r.hx * 0.97 &&
             Math.abs(p.z - r.z) < r.hz * 0.97
           ) {
-            game.startLanding({
-              x: r.x,
-              y: top,
-              z: r.z,
-              nx: 0,
-              nz: 1,
-            });
+            game.startLanding({ x: r.x, y: top, z: r.z, nx: 0, nz: 1 });
             return;
           }
         }
@@ -5785,22 +6190,16 @@ three/build/three.module.js:
           p.y > h.top - 1.45 &&
           p.y < h.top + 2.5
         ) {
-          game.startLanding({
-            x: h.x,
-            y: h.top,
-            z: h.z,
-            nx: 0,
-            nz: 1,
-          });
+          game.startLanding({ x: h.x, y: h.top, z: h.z, nx: 0, nz: 1 });
           return;
         }
       }
     }
 
-    // Затем дорога (включая мосты через реку).
+    // Затем дорога (включая мосты) и газон парка.
     if (
       p.y < 2.8 &&
-      isRoad(p.x, p.z) &&
+      (isRoad(p.x, p.z) || inParkLawn(p.x, p.z)) &&
       S.prevVy > -8.6 &&
       speed < 16
     ) {
@@ -5867,509 +6266,12 @@ three/build/three.module.js:
       game.addTimer(8.2, () => {
         if (game.phase === "flying") {
           game.showHint(
-            "Садись на крыши и на дорогу — подлетай и планируй вниз. Берегись машин и стен!",
+            "Садись на крыши, дорогу и газон парка — планируй вниз. Берегись машин и стен!",
             10,
           );
         }
       });
     };
-  }
-
-  /* ----------------------------------------------------------------- assets -- */
-
-  async function loadAssets() {
-    const T = S.T;
-    const loader = new T.GLTFLoader();
-
-    // Модели грузим параллельно: дома нужны раньше машин, а тяжёлые
-    // автомобильные GLB не должны задерживать застройку берегов.
-    const carSpecs = [
-      { url: "zhiguli_soviet_cars.glb", kind: "zhiguli", target: 4.5 },
-      { url: "zaz-1102.glb", kind: "plain", target: 4.05 },
-      { url: "vehicle_zis-101.glb", kind: "plain", target: 5.6 },
-      { url: "1965_ford_lotus_cortina_mk1.glb", kind: "plain", target: 4.35 },
-      { url: "lada_niva.glb", kind: "plain", target: 4.0, heavy: true },
-      {
-        url: "kraz_250_cement_carrier.glb",
-        kind: "plain",
-        target: 7.4,
-        heavy: true,
-      },
-      { url: "1973_amc_gremlin_x.glb", kind: "plain", target: 4.6, heavy: true },
-    ];
-
-    const carJobs = carSpecs.map((spec) =>
-      loadCarPrefabs(loader, S.packPromise, spec).catch((err) => {
-        console.warn("[Москва-Сити] модель авто не загрузилась:", spec.url, err);
-        return [];
-      }),
-    );
-
-    const lowHouseJob = loadPrefab(loader, S.packPromise, {
-      url: "low_poly_-_soviet__apartment_building_8k.glb",
-      target: 35,
-    }).catch((err) => {
-      console.warn("[Москва-Сити] модель хрущёвки не загрузилась:", err);
-      return null;
-    });
-    const panelHouseJob = loadPrefab(loader, S.packPromise, {
-      url: "soviet_panel_house_ussr.glb",
-      target: 48,
-    }).catch((err) => {
-      console.warn("[Москва-Сити] модель панельного дома не загрузилась:", err);
-      return null;
-    });
-
-    // --- дома -------------------------------------------------------------
-    const [lowHouse, panelHouse] = await Promise.all([
-      lowHouseJob,
-      panelHouseJob,
-    ]);
-    if (lowHouse) S.houseTemplates.push(lowHouse);
-    if (panelHouse) S.panelTemplate = panelHouse;
-    if (!S.houseTemplates.length) {
-      S.houseTemplates.push(makeFallbackHouse());
-    }
-    placeHouses();
-
-    // --- машины -----------------------------------------------------------
-    const carResults = await Promise.all(carJobs);
-    for (const prefabs of carResults) {
-      for (const prefab of prefabs) S.carTemplates.push(prefab);
-    }
-    if (S.carTemplates.length) assignCarModels();
-  }
-
-  async function loadCarPrefabs(loader, packPromise, spec) {
-    const gltf = await readModel(loader, packPromise, spec.url);
-    const out = [];
-    if (spec.kind === "zhiguli") {
-      const names = [
-        "zhiguli_gray",
-        "zhiguli_blue",
-        "zhiguli_green",
-        "zhiguli_red",
-      ];
-      for (const name of names) {
-        const node = extractNode(gltf.scene, name);
-        if (!node) continue;
-        const prefab = makePrefab(node, {
-          target: spec.target,
-          alignZ: true,
-        });
-        if (prefab) {
-          prefab.source = spec.url;
-          prefab.heavy = !!spec.heavy;
-          out.push(prefab);
-        }
-      }
-    } else {
-      const prefab = makePrefab(gltf.scene, {
-        target: spec.target,
-        alignZ: true,
-      });
-      if (prefab) {
-        prefab.source = spec.url;
-        prefab.heavy = !!spec.heavy;
-        out.push(prefab);
-      }
-    }
-    return out;
-  }
-
-  async function loadPrefab(loader, packPromise, spec) {
-    const gltf = await readModel(loader, packPromise, spec.url);
-    return makePrefab(gltf.scene, {
-      target: spec.target,
-      alignZ: true,
-    });
-  }
-
-  async function readModel(loader, packPromise, name) {
-    const pack = await packPromise;
-    const data = await pack.read(name);
-    return loader.parseAsync(data, "");
-  }
-
-  function extractNode(scene, name) {
-    const node = scene.getObjectByName(name);
-    if (!node) return null;
-    scene.updateMatrixWorld(true);
-    const clone = node.clone(true);
-    clone.applyMatrix4(node.matrixWorld);
-    return clone;
-  }
-
-  /* Схлопываем статичные меши модели в один меш на материал: у некоторых
-     GLB по сотне мелких деталей, и каждый клон дома/машины стоил бы
-     отдельного draw call. */
-  function mergeStaticMeshes(root) {
-    const T = S.T;
-    root.updateMatrixWorld(true);
-    const invRoot = new T.Matrix4().copy(root.matrixWorld).invert();
-    const groups = new Map();
-
-    root.traverse((mesh) => {
-      if (!mesh.isMesh || mesh.isSkinnedMesh) return;
-      if (!mesh.geometry || !mesh.geometry.attributes.position) return;
-      if (!mesh.material || Array.isArray(mesh.material)) return;
-
-      const keys = Object.keys(mesh.geometry.attributes).sort();
-      const key = mesh.material.uuid + "|" + keys.join(",");
-      let group = groups.get(key);
-      if (!group) {
-        group = { material: mesh.material, keys, items: [] };
-        groups.set(key, group);
-      }
-      group.items.push({
-        geometry: mesh.geometry,
-        matrix: new T.Matrix4().copy(invRoot).multiply(mesh.matrixWorld),
-      });
-    });
-
-    if (!groups.size) return;
-
-    const mergedRoot = new T.Group();
-    for (const group of groups.values()) {
-      const geometry = mergeGroupGeometry(group);
-      if (geometry) mergedRoot.add(new T.Mesh(geometry, group.material));
-    }
-    if (!mergedRoot.children.length) return;
-
-    while (root.children.length) root.remove(root.children[0]);
-    root.add(mergedRoot);
-  }
-
-  function mergeGroupGeometry(group) {
-    const T = S.T;
-    let vertexCount = 0;
-    let indexCount = 0;
-    const layouts = new Map();
-
-    for (const item of group.items) {
-      const pos = item.geometry.attributes.position;
-      const count = pos.count;
-      vertexCount += count;
-      indexCount += item.geometry.index
-        ? item.geometry.index.count
-        : count;
-
-      for (const key of group.keys) {
-        const attr = item.geometry.attributes[key];
-        if (!attr) continue;
-        let layout = layouts.get(key);
-        if (!layout) {
-          layout = {
-            itemSize: attr.itemSize,
-            normalized: !!attr.normalized,
-            ArrayType: attr.array.constructor,
-          };
-          layouts.set(key, layout);
-        }
-      }
-    }
-
-    if (!vertexCount) return null;
-
-    const output = new Map();
-    for (const [key, layout] of layouts) {
-      output.set(
-        key,
-        new layout.ArrayType(vertexCount * layout.itemSize),
-      );
-    }
-
-    const IndexArray = vertexCount > 65535 ? Uint32Array : Uint16Array;
-    const indices = new IndexArray(indexCount);
-    let vertexOffset = 0;
-    let indexOffset = 0;
-    const v = new T.Vector3();
-
-    for (const item of group.items) {
-      const geometry = item.geometry;
-      const pos = geometry.attributes.position;
-      const count = pos.count;
-      const m = item.matrix.elements;
-      const n = normalMatrix(m);
-      const index = geometry.index;
-
-      for (const key of group.keys) {
-        const attr = geometry.attributes[key];
-        const dst = output.get(key);
-        const itemSize = layouts.get(key).itemSize;
-        let out = vertexOffset * itemSize;
-
-        for (let i = 0; i < count; i++) {
-          const x = attr.getX(i);
-          const y = attr.getY(i);
-          const z = itemSize > 2 ? attr.getZ(i) : 0;
-
-          if (key === "position") {
-            dst[out] = m[0] * x + m[4] * y + m[8] * z + m[12];
-            dst[out + 1] = m[1] * x + m[5] * y + m[9] * z + m[13];
-            dst[out + 2] = m[2] * x + m[6] * y + m[10] * z + m[14];
-          } else if (key === "normal" || key === "tangent") {
-            v.set(
-              n[0] * x + n[1] * y + n[2] * z,
-              n[3] * x + n[4] * y + n[5] * z,
-              n[6] * x + n[7] * y + n[8] * z,
-            );
-            if (v.lengthSq() > 1e-12) v.normalize();
-            dst[out] = v.x;
-            dst[out + 1] = v.y;
-            dst[out + 2] = v.z;
-            if (itemSize > 3) dst[out + 3] = attr.getW(i);
-          } else if (itemSize > 3) {
-            dst[out] = x;
-            dst[out + 1] = y;
-            dst[out + 2] = z;
-            dst[out + 3] = attr.getW(i);
-          } else {
-            dst[out] = x;
-            dst[out + 1] = y;
-            if (itemSize > 2) dst[out + 2] = z;
-          }
-          out += itemSize;
-        }
-      }
-
-      if (index) {
-        for (let i = 0; i < index.count; i++) {
-          indices[indexOffset++] = index.getX(i) + vertexOffset;
-        }
-      } else {
-        for (let i = 0; i < count; i++) {
-          indices[indexOffset++] = vertexOffset + i;
-        }
-      }
-      vertexOffset += count;
-    }
-
-    const merged = new S.BufferGeometry();
-    for (const [key, layout] of layouts) {
-      merged.setAttribute(
-        key,
-        new S.BufferAttribute(
-          output.get(key),
-          layout.itemSize,
-          layout.normalized,
-        ),
-      );
-    }
-    merged.setIndex(new S.BufferAttribute(indices, 1));
-    merged.computeBoundingBox();
-    merged.computeBoundingSphere();
-    return merged;
-  }
-
-  function normalMatrix(m) {
-    const a00 = m[0], a01 = m[4], a02 = m[8];
-    const a10 = m[1], a11 = m[5], a12 = m[9];
-    const a20 = m[2], a21 = m[6], a22 = m[10];
-
-    const c00 = a11 * a22 - a12 * a21;
-    const c01 = a12 * a20 - a10 * a22;
-    const c02 = a10 * a21 - a11 * a20;
-    const c10 = a02 * a21 - a01 * a22;
-    const c11 = a00 * a22 - a02 * a20;
-    const c12 = a01 * a20 - a00 * a21;
-    const c20 = a01 * a12 - a02 * a11;
-    const c21 = a02 * a10 - a00 * a12;
-    const c22 = a00 * a11 - a01 * a10;
-
-    const det = a00 * c00 + a01 * c01 + a02 * c02;
-    if (Math.abs(det) < 1e-9) {
-      return [a00, a01, a02, a10, a11, a12, a20, a21, a22];
-    }
-    const inv = 1 / det;
-    return [
-      c00 * inv, c01 * inv, c02 * inv,
-      c10 * inv, c11 * inv, c12 * inv,
-      c20 * inv, c21 * inv, c22 * inv,
-    ];
-  }
-
-  function makePrefab(obj, opts) {
-    const T = S.T;
-    const align = new T.Group();
-    align.add(obj);
-    align.updateMatrixWorld(true);
-
-    let box = new T.Box3().setFromObject(align);
-    let size = box.getSize(new T.Vector3());
-    size.x = Math.max(size.x, 0.001);
-    size.y = Math.max(size.y, 0.001);
-    size.z = Math.max(size.z, 0.001);
-
-    if (opts && opts.alignZ && size.x > size.z * 1.08) {
-      align.rotation.y = Math.PI / 2;
-      align.updateMatrixWorld(true);
-      box = new T.Box3().setFromObject(align);
-      size = box.getSize(new T.Vector3());
-    }
-
-    const target = (opts && opts.target) || 10;
-    const scale = target / Math.max(size.x, size.z, 0.001);
-    const center = box.getCenter(new T.Vector3());
-
-    const shift = new T.Group();
-    shift.position.set(-center.x, -box.min.y, -center.z);
-    shift.add(align);
-
-    const wrapper = new T.Group();
-    wrapper.add(shift);
-    wrapper.scale.setScalar(scale);
-    wrapper.updateMatrixWorld(true);
-    mergeStaticMeshes(wrapper);
-
-    const finalBox = new T.Box3().setFromObject(wrapper);
-    const finalSize = finalBox.getSize(new T.Vector3());
-    return {
-      prefab: wrapper,
-      size: finalSize,
-      length: Math.max(finalSize.x, finalSize.z),
-      height: finalSize.y,
-    };
-  }
-
-  function assignCarModels() {
-    const T = S.T;
-    const light = S.carTemplates.filter((t) => !t.heavy);
-    const heavy = S.carTemplates.filter((t) => t.heavy);
-    const fallback = light.length ? light : S.carTemplates;
-
-    for (let index = 0; index < S.cars.length; index++) {
-      const car = S.cars[index];
-      // Тяжёлые модели показываем по разу, остальной поток — из лёгких.
-      const tmpl =
-        index < heavy.length
-          ? heavy[index]
-          : fallback[Math.floor(Math.random() * fallback.length)];
-      const visual = tmpl.prefab.clone(true);
-      if (car.visual) car.root.remove(car.visual);
-      car.visual = visual;
-      car.root.add(visual);
-      car.height = tmpl.height;
-      car.length = tmpl.length;
-      car.radius = Math.max(2.2, Math.min(4.2, tmpl.length * 0.38));
-
-      // Фары и стопы — чтобы машины читались в ночном городе.
-      const headMat = new T.MeshStandardMaterial({
-        color: 0xfff2c8,
-        emissive: 0xffd275,
-        emissiveIntensity: 2.2,
-        roughness: 0.3,
-      });
-      const tailMat = new T.MeshStandardMaterial({
-        color: 0x5d0b0b,
-        emissive: 0xff2020,
-        emissiveIntensity: 1.6,
-        roughness: 0.4,
-      });
-      const half = tmpl.length / 2;
-      for (const x of [-0.68, 0.68]) {
-        const hl = new T.Mesh(S.boxGeo, headMat);
-        hl.scale.set(0.3, 0.15, 0.08);
-        hl.position.set(x, 0.72, half + 0.05);
-        car.root.add(hl);
-        const tl = new T.Mesh(S.boxGeo, tailMat);
-        tl.scale.set(0.26, 0.13, 0.06);
-        tl.position.set(x, 0.72, -half - 0.05);
-        car.root.add(tl);
-      }
-    }
-  }
-
-  function makeFallbackHouse() {
-    const T = S.T;
-    const g = new T.Group();
-    const wallMat = new T.MeshStandardMaterial({
-      color: 0x343b43,
-      roughness: 0.88,
-      metalness: 0.04,
-    });
-    const winMat = new T.MeshStandardMaterial({
-      color: 0x10151c,
-      emissive: 0xffc46a,
-      emissiveIntensity: 0.85,
-      roughness: 0.5,
-    });
-
-    const main = new T.Mesh(S.boxGeo, wallMat);
-    main.scale.set(18, 16, 30);
-    main.position.y = 8;
-    g.add(main);
-
-    const roof = new T.Mesh(S.boxGeo, wallMat);
-    roof.scale.set(19, 1, 31);
-    roof.position.y = 16.5;
-    g.add(roof);
-
-    for (let i = 0; i < 14; i++) {
-      const w = new T.Mesh(S.boxGeo, winMat);
-      w.scale.set(1.5, 1.2, 0.08);
-      w.position.set(-7.5 + (i % 7) * 2.5, 5 + Math.floor(i / 7) * 6.5, 15.05);
-      g.add(w);
-    }
-    return {
-      prefab: g,
-      size: new T.Vector3(19, 17, 31),
-      length: 31,
-      height: 17,
-    };
-  }
-
-  function placeHouses() {
-    if (!S.houseTemplates.length) return;
-    const T = S.T;
-    const low = S.houseTemplates[0];
-    let panelUsed = false;
-
-    for (let gx = -6; gx <= 6; gx++) {
-      for (let gz = -6; gz <= 6; gz++) {
-        if (S.houses.length >= MAX_HOUSES) break;
-        if (Math.random() < 0.33) continue;
-
-        const sx = Math.random() < 0.5 ? -1 : 1;
-        const sz = Math.random() < 0.5 ? -1 : 1;
-        const x = gx * ROAD_STEP + sx * rand(20, 29);
-        const z = gz * ROAD_STEP + sz * rand(20, 29);
-        const r = Math.hypot(x, z);
-        if (r < 193 || r > 338) continue;
-        if (isRoad(x, z)) continue;
-
-        let tooClose = false;
-        for (const h of S.houses) {
-          if (Math.hypot(h.x - x, h.z - z) < 27) {
-            tooClose = true;
-            break;
-          }
-        }
-        if (tooClose) continue;
-
-        const usePanel = S.panelTemplate && !panelUsed && S.houses.length > 18;
-        const tmpl = usePanel ? S.panelTemplate : low;
-        if (usePanel) panelUsed = true;
-
-        const obj = tmpl.prefab.clone(true);
-        const yaw = (Math.random() < 0.5 ? 0 : Math.PI / 2) + rand(-0.16, 0.16);
-        obj.position.set(x, 0, z);
-        obj.rotation.y = yaw;
-        S.group.add(obj);
-
-        S.houses.push({
-          x,
-          z,
-          yaw,
-          cos: Math.cos(yaw),
-          sin: Math.sin(yaw),
-          hx: Math.max(4, tmpl.size.x / 2 - 0.5),
-          hz: Math.max(4, tmpl.size.z / 2 - 0.5),
-          top: tmpl.size.y,
-          obj,
-        });
-      }
-    }
   }
 
   boot();
