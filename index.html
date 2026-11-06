@@ -3,10 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>НЕОН-СИТИ: ПВО — сбей БПЛА рогаткой</title>
+<title>НЕОН-СИТИ 2.0 — ПВО на рогатке</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css">
 <script type="importmap">
 {
@@ -20,30 +20,36 @@
 <body>
 <canvas id="scene"></canvas>
 
-<div class="hud">
-  <div class="panel tl">СЧЁТ&nbsp;<span id="score">0</span><div class="sub">рекорд&nbsp;<span id="best">0</span></div></div>
-  <div class="panel tc">ВОЛНА&nbsp;<span id="wave">1</span><div class="sub">целей в небе&nbsp;<span id="targets">0</span></div></div>
-  <div class="panel tr"><div id="lives">♥♥♥</div><div class="sub">ПВО-позиция</div></div>
-  <div id="msg"></div>
-  <div id="hint">Зажми ЛКМ → потяни вниз/вбок → отпусти. Шар летит по баллистике!</div>
-</div>
+<div id="vignette"></div>
+<div id="flash"></div>
 
-<div id="damage"></div>
+<div class="hud">
+  <div class="panel tl">СЧЁТ <span id="score">0</span><div class="sub">рекорд <span id="best">0</span> · сбито <span id="kills">0</span></div></div>
+  <div class="panel tc">ВОЛНА <span id="wave">1</span><div class="sub">в небе: <span id="targets">0</span></div></div>
+  <div class="panel tr"><div id="lives"><span>♥</span><span>♥</span><span>♥</span></div><div class="sub">щиты города</div></div>
+
+  <div id="ammo"><i></i><i></i><i></i><i></i></div>
+  <div id="cross"><div class="ring"></div><div class="dot"></div><div class="tick t1"></div><div class="tick t2"></div><div class="tick t3"></div><div class="tick t4"></div><div id="power"></div></div>
+  <div id="lock"><b></b><b></b><b></b><b></b><span id="lockTxt">ЦЕЛЬ</span></div>
+  <div id="msg"></div>
+  <div id="hint">Мышь — наведение · <b>зажми ЛКМ</b> — натяжение · <b>отпусти</b> — выстрел · прожектор подсветит цель</div>
+</div>
 
 <div class="overlay" id="startOverlay">
   <div class="card">
-    <div class="tag">ГОРОД-7 · СЕКТОР «НЕОН»</div>
-    <h1>ПВО&nbsp;«НЕОН-СИТИ»</h1>
-    <p class="lead">БПЛА «Лютый» идут на город волнами. Твоя позиция — крыша небоскрёба и мощная рогатка с кибер-шарами.</p>
+    <div class="tag">ГОРОД-7 · СЕКТОР «НЕОН» · ЛИВЕНЬ</div>
+    <h1>ПВО «НЕОН-СИТИ»<i>2.0</i></h1>
+    <p class="lead">Дождь, неон и волны БПЛА «Лютый». Ты — на крыше, в руках рогатка с кибер-шарами, рядом боевой прожектор.</p>
     <ul>
-      <li><b>Зажми</b> кнопку мыши и потяни — как лук</li>
-      <li><b>Тяни вниз</b> — сила и высота, <b>вбок</b> — наведение</li>
-      <li><b>Отпусти</b> — шар улетает по параболе</li>
-      <li>Светящаяся дуга — <b>траектория полёта</b>, целься с упреждением</li>
-      <li>Прорвавшаяся цель отнимает ♥, три прорыва — конец обороны</li>
+      <li><b>Мышь</b> — наводишь (как в шутере, без инверсии)</li>
+      <li><b>Зажми ЛКМ</b> — натягиваешь резину, шар заряжается</li>
+      <li><b>Отпусти ЛКМ</b> — выстрел по параболе. Целься чуть выше цели!</li>
+      <li><b>Прожектор</b> — светит туда, куда целишься: он подсвечивает БПЛА</li>
+      <li>Магазин на 4 шара, перезарядка мгновенная — лупи без остановки</li>
+      <li>3 прорыва дрона к городу — оборона пала</li>
     </ul>
     <button id="startBtn">НАЧАТЬ ОБОРОНУ</button>
-    <div class="tiny">Three.js грузится с CDN · модели — из папки models/</div>
+    <div class="tiny">Three.js — CDN · модели: models/ · звук включится после клика</div>
   </div>
 </div>
 
